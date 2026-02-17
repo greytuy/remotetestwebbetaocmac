@@ -1,36 +1,770 @@
-# This is a basic workflow to help you get started with Actions
+name: Build Workflow
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+    inputs:
+      init_mode:
+        description: "OpenClaw init mode: manual or auto"
+        required: false
+        default: "manual"
+        type: choice
+        options:
+          - manual
+          - auto
+      manual_wait_minutes:
+        description: "Manual init max wait minutes (60-360)"
+        required: false
+        default: "360"
+      max_runtime_minutes:
+        description: "Monitor loop runtime minutes (60-345)"
+        required: false
+        default: "345"
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
   build:
-    # The type of runner that the job will run on
-    runs-on: ubuntu-latest
+    name: Build Stage
+    runs-on: macos-latest
+    timeout-minutes: 360
+    permissions:
+      actions: write
+      contents: read
+    defaults:
+      run:
+        shell: bash
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+      - name: Delete old workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 3
+          keep_minimum_runs: 3
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Resolve Workflow Inputs
+        env:
+          INPUT_INIT_MODE: ${{ github.event.inputs.init_mode }}
+          INPUT_MANUAL_WAIT_MINUTES: ${{ github.event.inputs.manual_wait_minutes }}
+          INPUT_MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes }}
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          set -euo pipefail
+
+          init_mode="${INPUT_INIT_MODE:-manual}"
+          if [[ "${init_mode}" != "manual" && "${init_mode}" != "auto" ]]; then
+            init_mode="manual"
+          fi
+
+          manual_wait_minutes="${INPUT_MANUAL_WAIT_MINUTES:-360}"
+          if ! [[ "${manual_wait_minutes}" =~ ^[0-9]+$ ]]; then
+            manual_wait_minutes=360
+          fi
+          if (( manual_wait_minutes < 60 )); then
+            manual_wait_minutes=60
+          fi
+          if (( manual_wait_minutes > 360 )); then
+            manual_wait_minutes=360
+          fi
+
+          max_runtime_minutes="${INPUT_MAX_RUNTIME_MINUTES:-345}"
+          if ! [[ "${max_runtime_minutes}" =~ ^[0-9]+$ ]]; then
+            max_runtime_minutes=345
+          fi
+          if (( max_runtime_minutes < 60 )); then
+            max_runtime_minutes=60
+          fi
+          if (( max_runtime_minutes > 345 )); then
+            max_runtime_minutes=345
+          fi
+
+          echo "INIT_MODE=${init_mode}" >> "${GITHUB_ENV}"
+          echo "MANUAL_WAIT_MINUTES=${manual_wait_minutes}" >> "${GITHUB_ENV}"
+          echo "MAX_RUNTIME_SECONDS=$((max_runtime_minutes * 60))" >> "${GITHUB_ENV}"
+          echo "OPENCLAW_STATE_DIR=${HOME}/.openclaw" >> "${GITHUB_ENV}"
+
+          echo "Init mode: ${init_mode}"
+          echo "Manual wait minutes: ${manual_wait_minutes}"
+          echo "Monitor runtime minutes: ${max_runtime_minutes}"
+
+      - name: Setup Utilities
+        run: |
+          set -euo pipefail
+          brew install cloudflared p7zip
+          npm install -g openclaw@latest
+          cloudflared --version
+          openclaw --version
+
+      - name: Validate Secrets
+        env:
+          TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
+          VNC_USER_PASSWORD: ${{ secrets.VNC_USER_PASSWORD }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${TUNNEL_TOKEN:-}" ]]; then
+            echo "Missing required secret: TUNNEL_TOKEN"
+            exit 1
+          fi
+          if [[ "${TUNNEL_TOKEN}" != eyJ* ]]; then
+            echo "TUNNEL_TOKEN format looks unexpected (it usually starts with eyJ)."
+            exit 1
+          fi
+
+          effective_user_password="${VNC_USER_PASSWORD:-${RDP_PASSWORD:-}}"
+          effective_vnc_password="${VNC_PASSWORD:-${RDP_PASSWORD:-}}"
+
+          if [[ -z "${effective_user_password}" || -z "${effective_vnc_password}" ]]; then
+            echo "Missing VNC credentials. Provide VNC_USER_PASSWORD and VNC_PASSWORD (or fallback RDP_PASSWORD)."
+            exit 1
+          fi
+
+          echo "::add-mask::${effective_user_password}"
+          echo "::add-mask::${effective_vnc_password}"
+
+          {
+            echo "EFFECTIVE_VNC_USER_PASSWORD<<EOF"
+            echo "${effective_user_password}"
+            echo "EOF"
+            echo "EFFECTIVE_VNC_PASSWORD<<EOF"
+            echo "${effective_vnc_password}"
+            echo "EOF"
+          } >> "${GITHUB_ENV}"
+
+          echo "Secret checks passed."
+
+      - name: Enable macOS VNC
+        run: |
+          set -euo pipefail
+
+          sudo mdutil -i off -a || true
+
+          if ! dscl . -read /Users/vncuser >/dev/null 2>&1; then
+            last_uid="$(dscl . -list /Users UniqueID | awk '{print $2}' | sort -n | tail -1)"
+            if [[ -z "${last_uid}" ]]; then
+              next_uid=1001
+            else
+              next_uid=$((last_uid + 1))
+            fi
+
+            sudo dscl . -create /Users/vncuser
+            sudo dscl . -create /Users/vncuser UserShell /bin/bash
+            sudo dscl . -create /Users/vncuser RealName "VNC User"
+            sudo dscl . -create /Users/vncuser UniqueID "${next_uid}"
+            sudo dscl . -create /Users/vncuser PrimaryGroupID 80
+            sudo dscl . -create /Users/vncuser NFSHomeDirectory /Users/vncuser
+            sudo createhomedir -c -u vncuser >/dev/null || true
+          fi
+
+          sudo dscl . -passwd /Users/vncuser "${EFFECTIVE_VNC_USER_PASSWORD}"
+
+          kickstart="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
+          sudo "${kickstart}" -configure -allowAccessFor -allUsers -privs -all
+          sudo "${kickstart}" -configure -clientopts -setvnclegacy -vnclegacy yes
+
+          printf '%s\n' "${EFFECTIVE_VNC_PASSWORD}" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA" }; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt >/dev/null
+
+          sudo "${kickstart}" -restart -agent -console
+          sudo "${kickstart}" -activate
+
+          for i in {1..10}; do
+            if lsof -nP -iTCP:5900 -sTCP:LISTEN >/dev/null 2>&1; then
+              echo "VNC is listening on localhost:5900"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "VNC listener was not detected on localhost:5900 (continue anyway, cloudflared may still connect)."
+
+      - name: Start Cloudflared
+        env:
+          TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          cf_log="${RUNNER_TEMP}/cloudflared.log"
+          cf_pid_file="${RUNNER_TEMP}/cloudflared.pid"
+
+          echo "CF_LOG_FILE=${cf_log}" >> "${GITHUB_ENV}"
+          echo "CF_PID_FILE=${cf_pid_file}" >> "${GITHUB_ENV}"
+
+          nohup cloudflared tunnel --no-autoupdate run --token "${TUNNEL_TOKEN}" > "${cf_log}" 2>&1 &
+          cf_pid="$!"
+          echo "${cf_pid}" > "${cf_pid_file}"
+          sleep 8
+
+          if ps -p "${cf_pid}" >/dev/null 2>&1; then
+            echo "cloudflared started (pid ${cf_pid})"
+          else
+            echo "cloudflared failed to start, check ${cf_log}"
+            tail -n 80 "${cf_log}" || true
+            exit 1
+          fi
+
+      - name: Create Backup Script
+        run: |
+          set -euo pipefail
+
+          script_path="${GITHUB_WORKSPACE}/backup-openclaw-state.sh"
+          cat > "${script_path}" <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          backup_pat="${1:-}"
+          backup_repo="${2:-}"
+
+          state_dir="${HOME}/.openclaw"
+          tmp_root="${RUNNER_TEMP:-/tmp}"
+
+          temp_copy="${tmp_root}/openclaw-copy-${RANDOM}"
+          temp_repo="${tmp_root}/openclaw-backup-${RANDOM}"
+          verify_repo="${tmp_root}/openclaw-verify-${RANDOM}"
+          archive_file="${tmp_root}/openclaw-state.tar.gz"
+          parts_prefix="${tmp_root}/openclaw-state.tar.gz.part."
+
+          cleanup() {
+            rm -rf "${temp_copy}" "${temp_repo}" "${verify_repo}"
+            rm -f "${archive_file}" "${parts_prefix}"*
+          }
+          trap cleanup EXIT
+
+          if [[ -z "${backup_pat}" || -z "${backup_repo}" ]]; then
+            echo "Backup secrets missing, skipping backup."
+            exit 0
+          fi
+
+          if [[ ! -d "${state_dir}" ]]; then
+            echo "OpenClaw state directory not found at ${state_dir}, skipping backup."
+            exit 0
+          fi
+
+          mkdir -p "${temp_copy}"
+          rsync -a --delete --exclude "*.lock" --exclude "*.tmp" "${state_dir}/" "${temp_copy}/"
+
+          if [[ -z "$(find "${temp_copy}" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+            echo "State directory is empty after filtering, skipping backup."
+            exit 0
+          fi
+
+          tar -C "${temp_copy}" -czf "${archive_file}" .
+
+          rm -f "${parts_prefix}"*
+          split -b 95m -d -a 3 "${archive_file}" "${parts_prefix}"
+
+          mapfile -t local_parts < <(ls "${parts_prefix}"* 2>/dev/null | sort)
+          if [[ "${#local_parts[@]}" -eq 0 ]]; then
+            echo "No split archive generated, backup failed."
+            exit 1
+          fi
+
+          total_bytes=0
+          for f in "${local_parts[@]}"; do
+            size="$(stat -f%z "${f}")"
+            total_bytes=$((total_bytes + size))
+          done
+          total_mb="$(awk -v bytes="${total_bytes}" 'BEGIN { printf "%.2f", bytes / 1024 / 1024 }')"
+          echo "Compressed backup: ${#local_parts[@]} part(s), ${total_mb} MB"
+
+          clone_url="https://${backup_pat}@github.com/${backup_repo}.git"
+          if ! git clone --depth 1 "${clone_url}" "${temp_repo}" >/dev/null 2>&1; then
+            echo "Backup repository clone failed. Check OPENCLAW_BACKUP_PAT and OPENCLAW_BACKUP_REPO."
+            exit 0
+          fi
+
+          rm -f "${temp_repo}/openclaw-state.zip"
+          rm -f "${temp_repo}"/openclaw-state.7z*
+          rm -f "${temp_repo}"/openclaw-state.tar.gz.part.*
+
+          for f in "${local_parts[@]}"; do
+            cp "${f}" "${temp_repo}/"
+          done
+
+          mapfile -t copied_parts < <(ls "${temp_repo}"/openclaw-state.tar.gz.part.* 2>/dev/null | sort)
+          if [[ "${#copied_parts[@]}" -ne "${#local_parts[@]}" ]]; then
+            echo "Part count mismatch after copy (${#copied_parts[@]}/${#local_parts[@]})."
+            exit 1
+          fi
+
+          for src in "${local_parts[@]}"; do
+            name="$(basename "${src}")"
+            dst="${temp_repo}/${name}"
+            if [[ ! -f "${dst}" ]]; then
+              echo "Missing copied part ${name}."
+              exit 1
+            fi
+            src_size="$(stat -f%z "${src}")"
+            dst_size="$(stat -f%z "${dst}")"
+            if [[ "${src_size}" -ne "${dst_size}" ]]; then
+              echo "Size mismatch for ${name}: src=${src_size}, dst=${dst_size}"
+              exit 1
+            fi
+          done
+          echo "Copy verification passed."
+
+          pushd "${temp_repo}" >/dev/null
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            msg="Backup $(date -u '+%Y-%m-%d %H:%M:%S UTC') [${#local_parts[@]} parts, ${total_mb}MB]"
+            git commit -m "${msg}" >/dev/null
+            if ! git push >/dev/null 2>&1; then
+              echo "Push failed, retrying in 5 seconds..."
+              sleep 5
+              git push >/dev/null
+            fi
+            echo "Backup pushed: ${msg}"
+          fi
+          popd >/dev/null
+
+          if git clone --depth 1 "${clone_url}" "${verify_repo}" >/dev/null 2>&1; then
+            mapfile -t remote_parts < <(ls "${verify_repo}"/openclaw-state.tar.gz.part.* 2>/dev/null | sort)
+            if [[ "${#remote_parts[@]}" -ne "${#local_parts[@]}" ]]; then
+              echo "VERIFY WARNING: remote part count mismatch (${#remote_parts[@]}/${#local_parts[@]})."
+            else
+              verify_ok="true"
+              for src in "${local_parts[@]}"; do
+                name="$(basename "${src}")"
+                src_size="$(stat -f%z "${src}")"
+                remote_file="${verify_repo}/${name}"
+                if [[ ! -f "${remote_file}" ]]; then
+                  verify_ok="false"
+                  echo "VERIFY WARNING: remote missing ${name}"
+                  continue
+                fi
+                remote_size="$(stat -f%z "${remote_file}")"
+                if [[ "${src_size}" -ne "${remote_size}" ]]; then
+                  verify_ok="false"
+                  echo "VERIFY WARNING: size mismatch for ${name} (src=${src_size}, remote=${remote_size})"
+                fi
+              done
+              if [[ "${verify_ok}" == "true" ]]; then
+                echo "VERIFIED OK: remote parts and sizes match."
+              fi
+            fi
+          else
+            echo "VERIFY WARNING: unable to clone backup repo for post-push verification."
+          fi
+          SCRIPT
+
+          chmod +x "${script_path}"
+          echo "Backup script created at ${script_path}"
+
+      - name: Restore OpenClaw State
+        id: restore
+        env:
+          BACKUP_PAT: ${{ secrets.OPENCLAW_BACKUP_PAT }}
+          BACKUP_REPO: ${{ secrets.OPENCLAW_BACKUP_REPO }}
+        run: |
+          set -euo pipefail
+
+          state_dir="${HOME}/.openclaw"
+          temp_repo="${RUNNER_TEMP}/openclaw-restore-${RANDOM}"
+          bundle="${RUNNER_TEMP}/openclaw-restore.tar.gz"
+          restored="false"
+
+          mkdir -p "${state_dir}"
+
+          if [[ -z "${BACKUP_PAT:-}" || -z "${BACKUP_REPO:-}" ]]; then
+            echo "Backup secrets missing, skip restore."
+          elif git clone --depth 1 "https://${BACKUP_PAT}@github.com/${BACKUP_REPO}.git" "${temp_repo}" >/dev/null 2>&1; then
+            if ls "${temp_repo}"/openclaw-state.tar.gz.part.* >/dev/null 2>&1; then
+              mapfile -t parts < <(ls "${temp_repo}"/openclaw-state.tar.gz.part.* | sort)
+              cat "${parts[@]}" > "${bundle}"
+              tar -xzf "${bundle}" -C "${state_dir}"
+              restored="true"
+              echo "Restored from tar.gz split backup (${#parts[@]} part(s))."
+            elif [[ -f "${temp_repo}/openclaw-state.7z.001" ]]; then
+              if 7z t "${temp_repo}/openclaw-state.7z.001" >/dev/null 2>&1; then
+                7z x "${temp_repo}/openclaw-state.7z.001" -o"${state_dir}" -aoa >/dev/null
+                restored="true"
+                echo "Restored from legacy 7z backup."
+              else
+                echo "Legacy 7z backup integrity check failed, skipping restore."
+              fi
+            elif [[ -f "${temp_repo}/openclaw-state.zip" ]]; then
+              unzip -o "${temp_repo}/openclaw-state.zip" -d "${state_dir}" >/dev/null
+              restored="true"
+              echo "Restored from legacy zip backup."
+            else
+              echo "No previous backup found. This is a fresh state."
+            fi
+          else
+            echo "Backup repository clone failed, skip restore."
+          fi
+
+          has_config="false"
+          if [[ -f "${state_dir}/openclaw.json" ]]; then
+            has_config="true"
+          fi
+
+          echo "restored=${restored}" >> "${GITHUB_OUTPUT}"
+          echo "has_config=${has_config}" >> "${GITHUB_OUTPUT}"
+
+          rm -rf "${temp_repo}"
+          rm -f "${bundle}"
+
+      - name: Initialize OpenClaw
+        id: initialize
+        env:
+          HAS_CONFIG: ${{ steps.restore.outputs.has_config }}
+          INIT_MODE: ${{ env.INIT_MODE }}
+          MANUAL_WAIT_MINUTES: ${{ env.MANUAL_WAIT_MINUTES }}
+          OPENCLAW_AUTH_CHOICE: ${{ secrets.OPENCLAW_AUTH_CHOICE }}
+          OPENCLAW_ANTHROPIC_API_KEY: ${{ secrets.OPENCLAW_ANTHROPIC_API_KEY }}
+          OPENCLAW_ZAI_API_KEY: ${{ secrets.OPENCLAW_ZAI_API_KEY }}
+          OPENCLAW_OPENCODE_API_KEY: ${{ secrets.OPENCLAW_OPENCODE_API_KEY }}
+          OPENCLAW_CF_ACCOUNT_ID: ${{ secrets.OPENCLAW_CF_ACCOUNT_ID }}
+          OPENCLAW_CF_GATEWAY_ID: ${{ secrets.OPENCLAW_CF_GATEWAY_ID }}
+          OPENCLAW_CF_API_KEY: ${{ secrets.OPENCLAW_CF_API_KEY }}
+          OPENCLAW_CUSTOM_BASE_URL: ${{ secrets.OPENCLAW_CUSTOM_BASE_URL }}
+          OPENCLAW_CUSTOM_MODEL_ID: ${{ secrets.OPENCLAW_CUSTOM_MODEL_ID }}
+          OPENCLAW_CUSTOM_API_KEY: ${{ secrets.OPENCLAW_CUSTOM_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          config_path="${HOME}/.openclaw/openclaw.json"
+          initialized_now="false"
+          actual_mode="${INIT_MODE:-manual}"
+
+          run_auto_onboard() {
+            local common=(
+              openclaw onboard
+              --non-interactive
+              --mode local
+              --gateway-port 18789
+              --gateway-bind loopback
+              --install-daemon
+              --daemon-runtime node
+              --skip-skills
+            )
+
+            case "${OPENCLAW_AUTH_CHOICE:-}" in
+              apiKey|anthropic-api-key)
+                if [[ -z "${OPENCLAW_ANTHROPIC_API_KEY:-}" ]]; then
+                  echo "Missing OPENCLAW_ANTHROPIC_API_KEY for auto mode."
+                  return 1
+                fi
+                "${common[@]}" --auth-choice apiKey --anthropic-api-key "${OPENCLAW_ANTHROPIC_API_KEY}"
+                ;;
+              zai-api-key)
+                if [[ -z "${OPENCLAW_ZAI_API_KEY:-}" ]]; then
+                  echo "Missing OPENCLAW_ZAI_API_KEY for auto mode."
+                  return 1
+                fi
+                "${common[@]}" --auth-choice zai-api-key --zai-api-key "${OPENCLAW_ZAI_API_KEY}"
+                ;;
+              opencode-zen)
+                if [[ -z "${OPENCLAW_OPENCODE_API_KEY:-}" ]]; then
+                  echo "Missing OPENCLAW_OPENCODE_API_KEY for auto mode."
+                  return 1
+                fi
+                "${common[@]}" --auth-choice opencode-zen --opencode-zen-api-key "${OPENCLAW_OPENCODE_API_KEY}"
+                ;;
+              cloudflare-ai-gateway-api-key)
+                if [[ -z "${OPENCLAW_CF_ACCOUNT_ID:-}" || -z "${OPENCLAW_CF_GATEWAY_ID:-}" || -z "${OPENCLAW_CF_API_KEY:-}" ]]; then
+                  echo "Missing Cloudflare AI Gateway secrets for auto mode."
+                  return 1
+                fi
+                "${common[@]}" \
+                  --auth-choice cloudflare-ai-gateway-api-key \
+                  --cloudflare-ai-gateway-account-id "${OPENCLAW_CF_ACCOUNT_ID}" \
+                  --cloudflare-ai-gateway-gateway-id "${OPENCLAW_CF_GATEWAY_ID}" \
+                  --cloudflare-ai-gateway-api-key "${OPENCLAW_CF_API_KEY}"
+                ;;
+              custom-api-key)
+                if [[ -z "${OPENCLAW_CUSTOM_BASE_URL:-}" || -z "${OPENCLAW_CUSTOM_MODEL_ID:-}" ]]; then
+                  echo "Missing OPENCLAW_CUSTOM_BASE_URL or OPENCLAW_CUSTOM_MODEL_ID for auto mode."
+                  return 1
+                fi
+                "${common[@]}" \
+                  --auth-choice custom-api-key \
+                  --custom-base-url "${OPENCLAW_CUSTOM_BASE_URL}" \
+                  --custom-model-id "${OPENCLAW_CUSTOM_MODEL_ID}" \
+                  --custom-api-key "${OPENCLAW_CUSTOM_API_KEY:-}" \
+                  --custom-compatibility openai
+                ;;
+              *)
+                echo "Auto mode is enabled but OPENCLAW_AUTH_CHOICE is missing/unsupported."
+                return 1
+                ;;
+            esac
+          }
+
+          if [[ "${HAS_CONFIG:-false}" == "true" && -f "${config_path}" ]]; then
+            echo "Existing OpenClaw state found, skip first-run initialization."
+            echo "initialized_now=false" >> "${GITHUB_OUTPUT}"
+            echo "init_mode_used=history" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [[ "${actual_mode}" == "auto" ]]; then
+            echo "Trying auto onboarding..."
+            if run_auto_onboard && [[ -f "${config_path}" ]]; then
+              initialized_now="true"
+              echo "Auto onboarding completed."
+            else
+              echo "Auto onboarding unavailable/failed, fallback to manual onboarding."
+              actual_mode="manual"
+            fi
+          fi
+
+          if [[ ! -f "${config_path}" ]]; then
+            wait_minutes="${MANUAL_WAIT_MINUTES:-360}"
+            wait_seconds=$((wait_minutes * 60))
+            elapsed=0
+            interval=30
+
+            echo "======================================================"
+            echo "No historical OpenClaw state detected."
+            echo "Please connect through your VNC/SSH path and run:"
+            echo "  openclaw onboard"
+            echo "Then run (recommended):"
+            echo "  openclaw doctor --repair"
+            echo "Optional health checks:"
+            echo "  openclaw status"
+            echo "  openclaw gateway status"
+            echo "======================================================"
+            echo "Waiting up to ${wait_minutes} minute(s) for manual onboarding..."
+
+            while (( elapsed < wait_seconds )); do
+              if [[ -f "${config_path}" ]]; then
+                initialized_now="true"
+                echo "Detected ${config_path}. Manual onboarding finished."
+                break
+              fi
+              sleep "${interval}"
+              elapsed=$((elapsed + interval))
+              if (( elapsed % 300 == 0 )); then
+                remain=$(((wait_seconds - elapsed) / 60))
+                echo "Still waiting for manual onboarding... remaining ${remain} minute(s)."
+              fi
+            done
+
+            if [[ ! -f "${config_path}" ]]; then
+              echo "Manual onboarding timeout after ${wait_minutes} minute(s)."
+              exit 1
+            fi
+          fi
+
+          echo "initialized_now=${initialized_now}" >> "${GITHUB_OUTPUT}"
+          echo "init_mode_used=${actual_mode}" >> "${GITHUB_OUTPUT}"
+
+      - name: Run Doctor Repair
+        run: |
+          set -euo pipefail
+
+          if openclaw doctor --repair; then
+            echo "openclaw doctor --repair completed."
+          else
+            echo "doctor --repair failed, trying non-interactive safe pass."
+            openclaw doctor --non-interactive || true
+          fi
+
+      - name: First Initialization Snapshot Backup
+        if: steps.initialize.outputs.initialized_now == 'true'
+        env:
+          BACKUP_PAT: ${{ secrets.OPENCLAW_BACKUP_PAT }}
+          BACKUP_REPO: ${{ secrets.OPENCLAW_BACKUP_REPO }}
+        run: |
+          set -euo pipefail
+
+          script_path="${GITHUB_WORKSPACE}/backup-openclaw-state.sh"
+          if [[ -x "${script_path}" ]]; then
+            echo "Running first initialization snapshot backup..."
+            "${script_path}" "${BACKUP_PAT:-}" "${BACKUP_REPO:-}"
+          else
+            echo "Backup script missing, skip first snapshot backup."
+          fi
+
+      - name: Monitor, Auto-Restart, and Periodic Backup
+        env:
+          TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
+          BACKUP_PAT: ${{ secrets.OPENCLAW_BACKUP_PAT }}
+          BACKUP_REPO: ${{ secrets.OPENCLAW_BACKUP_REPO }}
+          MAX_RUNTIME_SECONDS: ${{ env.MAX_RUNTIME_SECONDS }}
+          CF_PID_FILE: ${{ env.CF_PID_FILE }}
+          CF_LOG_FILE: ${{ env.CF_LOG_FILE }}
+        run: |
+          set -euo pipefail
+
+          backup_interval=1800
+          max_runtime="${MAX_RUNTIME_SECONDS:-20700}"
+          elapsed=0
+          last_backup=0
+
+          gw_log="${RUNNER_TEMP}/openclaw-gateway.log"
+          gw_pid_file="${RUNNER_TEMP}/openclaw-gateway.pid"
+          cf_pid_file="${CF_PID_FILE:-${RUNNER_TEMP}/cloudflared.pid}"
+          cf_log_file="${CF_LOG_FILE:-${RUNNER_TEMP}/cloudflared.log}"
+          backup_script="${GITHUB_WORKSPACE}/backup-openclaw-state.sh"
+
+          gw_fail_count=0
+          gw_max_fails=5
+          cf_fail_count=0
+          cf_max_fails=5
+
+          is_gateway_listening() {
+            lsof -nP -iTCP:18789 -sTCP:LISTEN >/dev/null 2>&1
+          }
+
+          stop_gateway_listener() {
+            local pids
+            pids="$(lsof -tiTCP:18789 -sTCP:LISTEN || true)"
+            if [[ -n "${pids}" ]]; then
+              # shellcheck disable=SC2086
+              kill -9 ${pids} || true
+            fi
+          }
+
+          start_gateway() {
+            stop_gateway_listener
+            rm -f "${gw_log}"
+            nohup openclaw gateway --port 18789 --allow-unconfigured > "${gw_log}" 2>&1 &
+            echo "$!" > "${gw_pid_file}"
+
+            for i in {1..10}; do
+              sleep 3
+              if is_gateway_listening; then
+                echo "Gateway listening on port 18789."
+                return 0
+              fi
+            done
+
+            echo "Gateway failed to listen within 30 seconds."
+            if [[ -f "${gw_log}" ]]; then
+              echo "--- gateway log (last 40 lines) ---"
+              tail -n 40 "${gw_log}" || true
+              echo "--- end gateway log ---"
+            fi
+            return 1
+          }
+
+          is_cloudflared_running() {
+            if [[ ! -f "${cf_pid_file}" ]]; then
+              return 1
+            fi
+            local pid
+            pid="$(cat "${cf_pid_file}" 2>/dev/null || true)"
+            if [[ -z "${pid}" ]]; then
+              return 1
+            fi
+            ps -p "${pid}" >/dev/null 2>&1
+          }
+
+          start_cloudflared() {
+            if [[ -z "${TUNNEL_TOKEN:-}" ]]; then
+              echo "TUNNEL_TOKEN missing, cannot restart cloudflared."
+              return 1
+            fi
+
+            rm -f "${cf_log_file}"
+            nohup cloudflared tunnel --no-autoupdate run --token "${TUNNEL_TOKEN}" > "${cf_log_file}" 2>&1 &
+            echo "$!" > "${cf_pid_file}"
+            sleep 8
+
+            if is_cloudflared_running; then
+              echo "cloudflared is running."
+              return 0
+            fi
+
+            echo "cloudflared restart failed."
+            if [[ -f "${cf_log_file}" ]]; then
+              echo "--- cloudflared log (last 40 lines) ---"
+              tail -n 40 "${cf_log_file}" || true
+              echo "--- end cloudflared log ---"
+            fi
+            return 1
+          }
+
+          if ! is_gateway_listening; then
+            echo "Gateway is not running, starting now..."
+            if ! start_gateway; then
+              gw_fail_count=$((gw_fail_count + 1))
+            fi
+          fi
+
+          if ! is_cloudflared_running; then
+            echo "cloudflared is not running, starting now..."
+            if ! start_cloudflared; then
+              cf_fail_count=$((cf_fail_count + 1))
+            fi
+          fi
+
+          while (( elapsed < max_runtime )); do
+            sleep 60
+            elapsed=$((elapsed + 60))
+            run_min=$((elapsed / 60))
+            now="$(date '+%H:%M:%S')"
+
+            if ! is_gateway_listening; then
+              if (( gw_fail_count < gw_max_fails )); then
+                echo "[${now}] Gateway down, restarting ($((gw_fail_count + 1))/${gw_max_fails})..."
+                if start_gateway; then
+                  gw_fail_count=0
+                else
+                  gw_fail_count=$((gw_fail_count + 1))
+                fi
+              fi
+              if (( gw_fail_count >= gw_max_fails )); then
+                echo "[${now}] Gateway restart limit reached. Please connect and fix manually."
+              fi
+            elif (( gw_fail_count > 0 )); then
+              echo "[${now}] Gateway recovered, reset fail counter."
+              gw_fail_count=0
+            fi
+
+            if ! is_cloudflared_running; then
+              if (( cf_fail_count < cf_max_fails )); then
+                echo "[${now}] cloudflared down, restarting ($((cf_fail_count + 1))/${cf_max_fails})..."
+                if start_cloudflared; then
+                  cf_fail_count=0
+                else
+                  cf_fail_count=$((cf_fail_count + 1))
+                fi
+              fi
+              if (( cf_fail_count >= cf_max_fails )); then
+                echo "[${now}] cloudflared restart limit reached. Please check tunnel token/config."
+              fi
+            elif (( cf_fail_count > 0 )); then
+              echo "[${now}] cloudflared recovered, reset fail counter."
+              cf_fail_count=0
+            fi
+
+            if (( elapsed - last_backup >= backup_interval )); then
+              echo "[${now}] Periodic backup at runtime ${run_min} minute(s)."
+              if [[ -x "${backup_script}" ]]; then
+                "${backup_script}" "${BACKUP_PAT:-}" "${BACKUP_REPO:-}" || echo "Periodic backup failed."
+              else
+                echo "Backup script not found, skip periodic backup."
+              fi
+              last_backup="${elapsed}"
+            fi
+          done
+
+          echo "Monitor window finished after $((max_runtime / 60)) minute(s)."
+
+      - name: Final State Backup
+        if: always()
+        env:
+          BACKUP_PAT: ${{ secrets.OPENCLAW_BACKUP_PAT }}
+          BACKUP_REPO: ${{ secrets.OPENCLAW_BACKUP_REPO }}
+        run: |
+          set -euo pipefail
+
+          script_path="${GITHUB_WORKSPACE}/backup-openclaw-state.sh"
+          if [[ -x "${script_path}" ]]; then
+            echo "Running final state backup..."
+            "${script_path}" "${BACKUP_PAT:-}" "${BACKUP_REPO:-}" || echo "Final backup failed."
+          else
+            echo "Backup script not found, skip final backup."
+          fi
+
+          echo "Final backup step completed."
