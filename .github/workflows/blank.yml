@@ -104,10 +104,13 @@ jobs:
           set -euo pipefail
           brew install cloudflared p7zip
           npm install -g openclaw@latest
-          curl -fsSL https://opencode.ai/install | bash
           cloudflared --version
           openclaw --version
-          opencode --version 2>/dev/null || echo "opencode installed (version check skipped)"
+
+          set +eo pipefail
+          curl -fsSL https://opencode.ai/install | bash
+          opencode version || opencode --version || echo "opencode install/version check skipped (non-critical)."
+          set -euo pipefail
 
       - name: Validate Secrets
         env:
