@@ -153,6 +153,15 @@ jobs:
 
           sudo mdutil -i off -a || true
 
+          # ── Shorten hostname (mDNS labels must be <=63 bytes) ──
+          current_hostname="$(hostname)"
+          if (( ${#current_hostname} > 50 )); then
+            short_name="mac-oc-${RANDOM}"
+            sudo scutil --set ComputerName "${short_name}"
+            sudo scutil --set LocalHostName "${short_name}"
+            echo "Hostname shortened: ${current_hostname} -> ${short_name}"
+          fi
+
           pw="${EFFECTIVE_VNC_USER_PASSWORD}"
           cf_user="${CF_SSH_USER:-}"
 
