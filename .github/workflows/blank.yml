@@ -178,14 +178,28 @@ jobs:
           echo "TCC entries applied."
           sudo sqlite3 "${tcc_sys}" "SELECT service,client,auth_value FROM access WHERE service LIKE 'kTCCService%' AND client LIKE '%screen%' OR client LIKE '%ARDAgent%';" 2>/dev/null || true
 
-          # ── Create vncuser ──
+          # ── Set password for the existing runner user (Anka / runner) ──
+          current_user="$(whoami)"
+          echo "Current runner user: ${current_user}"
+          sudo dscl . -passwd "/Users/${current_user}" "${EFFECTIVE_VNC_USER_PASSWORD}" 2>/dev/null || true
+
+          console_user="$(stat -f%Su /dev/console 2>/dev/null || echo '')"
+          if [[ -n "${console_user}" && "${console_user}" != "${current_user}" && "${console_user}" != "root" ]]; then
+            echo "Console user: ${console_user}"
+            sudo dscl . -passwd "/Users/${console_user}" "${EFFECTIVE_VNC_USER_PASSWORD}" 2>/dev/null || true
+          fi
+
+          for candidate in anka admin runner; do
+            if [[ "${candidate}" != "${current_user}" && "${candidate}" != "${console_user}" ]] && dscl . -read "/Users/${candidate}" >/dev/null 2>&1; then
+              echo "Also setting password for user: ${candidate}"
+              sudo dscl . -passwd "/Users/${candidate}" "${EFFECTIVE_VNC_USER_PASSWORD}" 2>/dev/null || true
+            fi
+          done
+
+          # ── Create vncuser as fallback ──
           if ! dscl . -read /Users/vncuser >/dev/null 2>&1; then
             last_uid="$(dscl . -list /Users UniqueID | awk '{print $2}' | sort -n | tail -1)"
-            if [[ -z "${last_uid}" ]]; then
-              next_uid=1001
-            else
-              next_uid=$((last_uid + 1))
-            fi
+            next_uid=$(( ${last_uid:-1000} + 1 ))
 
             sudo dscl . -create /Users/vncuser
             sudo dscl . -create /Users/vncuser UserShell /bin/bash
@@ -195,8 +209,10 @@ jobs:
             sudo dscl . -create /Users/vncuser NFSHomeDirectory /Users/vncuser
             sudo createhomedir -c -u vncuser >/dev/null || true
           fi
-
           sudo dscl . -passwd /Users/vncuser "${EFFECTIVE_VNC_USER_PASSWORD}"
+
+          echo "All user passwords set. Available accounts:"
+          dscl . -list /Users UniqueID | awk '$2 >= 500 {print "  - " $1 " (uid " $2 ")"}'
 
           # ── Configure Remote Management / VNC ──
           kickstart="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
@@ -223,6 +239,14 @@ jobs:
             fi
             sleep 3
           done
+
+          # ── Lower resolution for smoother VNC ──
+          if command -v screenresolution >/dev/null 2>&1; then
+            screenresolution set 1280x800x32 2>/dev/null || true
+          else
+            brew install --quiet screenresolution 2>/dev/null || true
+            screenresolution set 1280x800x32 2>/dev/null || true
+          fi
 
           # ── Diagnostics ──
           echo "=== VNC listener check ==="
