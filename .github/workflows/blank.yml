@@ -104,8 +104,10 @@ jobs:
           set -euo pipefail
           brew install cloudflared p7zip
           npm install -g openclaw@latest
+          curl -fsSL https://opencode.ai/install | bash
           cloudflared --version
           openclaw --version
+          opencode --version 2>/dev/null || echo "opencode installed (version check skipped)"
 
       - name: Validate Secrets
         env:
@@ -113,6 +115,9 @@ jobs:
           VNC_USER_PASSWORD: ${{ secrets.VNC_USER_PASSWORD }}
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+          WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+          WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
         run: |
           set -euo pipefail
 
@@ -144,6 +149,13 @@ jobs:
             echo "${effective_vnc_password}"
             echo "EOF"
           } >> "${GITHUB_ENV}"
+
+          if [[ -n "${WEBDAV_URL:-}" && -n "${WEBDAV_USER:-}" && -n "${WEBDAV_PASSWORD:-}" ]]; then
+            echo "::add-mask::${WEBDAV_PASSWORD}"
+            echo "WebDAV backup configured."
+          else
+            echo "WARNING: WebDAV secrets incomplete (WEBDAV_URL, WEBDAV_USER, WEBDAV_PASSWORD). Backup/restore disabled."
+          fi
 
           echo "Secret checks passed."
 
@@ -278,31 +290,25 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
 
-          backup_pat="${1:-}"
-          backup_repo="${2:-}"
+          webdav_url="${1:-}"
+          webdav_user="${2:-}"
+          webdav_pass="${3:-}"
 
           state_dir="${HOME}/.openclaw"
           tmp_root="${RUNNER_TEMP:-/tmp}"
-
           temp_copy="${tmp_root}/openclaw-copy-${RANDOM}"
-          temp_repo="${tmp_root}/openclaw-backup-${RANDOM}"
-          verify_repo="${tmp_root}/openclaw-verify-${RANDOM}"
           archive_file="${tmp_root}/openclaw-state.tar.gz"
-          parts_prefix="${tmp_root}/openclaw-state.tar.gz.part."
 
-          cleanup() {
-            rm -rf "${temp_copy}" "${temp_repo}" "${verify_repo}"
-            rm -f "${archive_file}" "${parts_prefix}"*
-          }
+          cleanup() { rm -rf "${temp_copy}"; rm -f "${archive_file}"; }
           trap cleanup EXIT
 
-          if [[ -z "${backup_pat}" || -z "${backup_repo}" ]]; then
-            echo "Backup secrets missing, skipping backup."
+          if [[ -z "${webdav_url}" || -z "${webdav_user}" || -z "${webdav_pass}" ]]; then
+            echo "WebDAV secrets missing, skipping backup."
             exit 0
           fi
 
           if [[ ! -d "${state_dir}" ]]; then
-            echo "OpenClaw state directory not found at ${state_dir}, skipping backup."
+            echo "OpenClaw state directory not found, skipping backup."
             exit 0
           fi
 
@@ -315,106 +321,31 @@ jobs:
           fi
 
           tar -C "${temp_copy}" -czf "${archive_file}" .
+          file_size="$(stat -f%z "${archive_file}" 2>/dev/null || stat -c%s "${archive_file}" 2>/dev/null || echo 0)"
+          size_mb="$(awk -v b="${file_size}" 'BEGIN { printf "%.2f", b/1024/1024 }')"
+          echo "Archive size: ${size_mb} MB"
 
-          rm -f "${parts_prefix}"*
-          split -b 95m -d -a 3 "${archive_file}" "${parts_prefix}"
+          base_url="${webdav_url%/}"
+          curl -sf -X MKCOL -u "${webdav_user}:${webdav_pass}" "${base_url}/openclaw-backup/" 2>/dev/null || true
 
-          mapfile -t local_parts < <(ls "${parts_prefix}"* 2>/dev/null | sort)
-          if [[ "${#local_parts[@]}" -eq 0 ]]; then
-            echo "No split archive generated, backup failed."
+          remote_path="${base_url}/openclaw-backup/openclaw-state.tar.gz"
+          http_code="$(curl -w '%{http_code}' -o /dev/null -s \
+            -T "${archive_file}" \
+            -u "${webdav_user}:${webdav_pass}" \
+            "${remote_path}")"
+
+          if [[ "${http_code}" =~ ^2 ]]; then
+            echo "Backup uploaded OK (HTTP ${http_code}): ${remote_path}"
+          else
+            echo "Backup upload FAILED (HTTP ${http_code})."
             exit 1
           fi
 
-          total_bytes=0
-          for f in "${local_parts[@]}"; do
-            size="$(stat -f%z "${f}")"
-            total_bytes=$((total_bytes + size))
-          done
-          total_mb="$(awk -v bytes="${total_bytes}" 'BEGIN { printf "%.2f", bytes / 1024 / 1024 }')"
-          echo "Compressed backup: ${#local_parts[@]} part(s), ${total_mb} MB"
-
-          clone_url="https://${backup_pat}@github.com/${backup_repo}.git"
-          if ! git clone --depth 1 "${clone_url}" "${temp_repo}" >/dev/null 2>&1; then
-            echo "Backup repository clone failed. Check OPENCLAW_BACKUP_PAT and OPENCLAW_BACKUP_REPO."
-            exit 0
-          fi
-
-          rm -f "${temp_repo}/openclaw-state.zip"
-          rm -f "${temp_repo}"/openclaw-state.7z*
-          rm -f "${temp_repo}"/openclaw-state.tar.gz.part.*
-
-          for f in "${local_parts[@]}"; do
-            cp "${f}" "${temp_repo}/"
-          done
-
-          mapfile -t copied_parts < <(ls "${temp_repo}"/openclaw-state.tar.gz.part.* 2>/dev/null | sort)
-          if [[ "${#copied_parts[@]}" -ne "${#local_parts[@]}" ]]; then
-            echo "Part count mismatch after copy (${#copied_parts[@]}/${#local_parts[@]})."
-            exit 1
-          fi
-
-          for src in "${local_parts[@]}"; do
-            name="$(basename "${src}")"
-            dst="${temp_repo}/${name}"
-            if [[ ! -f "${dst}" ]]; then
-              echo "Missing copied part ${name}."
-              exit 1
-            fi
-            src_size="$(stat -f%z "${src}")"
-            dst_size="$(stat -f%z "${dst}")"
-            if [[ "${src_size}" -ne "${dst_size}" ]]; then
-              echo "Size mismatch for ${name}: src=${src_size}, dst=${dst_size}"
-              exit 1
-            fi
-          done
-          echo "Copy verification passed."
-
-          pushd "${temp_repo}" >/dev/null
-          git config user.email "actions@github.com"
-          git config user.name "GitHub Actions"
-          git add -A
-
-          if git diff --cached --quiet; then
-            echo "No changes to commit."
+          verify_size="$(curl -sI -u "${webdav_user}:${webdav_pass}" "${remote_path}" | grep -i content-length | awk '{print $2}' | tr -d '\r')"
+          if [[ -n "${verify_size}" && "${verify_size}" == "${file_size}" ]]; then
+            echo "VERIFIED OK: remote size matches (${verify_size} bytes)."
           else
-            msg="Backup $(date -u '+%Y-%m-%d %H:%M:%S UTC') [${#local_parts[@]} parts, ${total_mb}MB]"
-            git commit -m "${msg}" >/dev/null
-            if ! git push >/dev/null 2>&1; then
-              echo "Push failed, retrying in 5 seconds..."
-              sleep 5
-              git push >/dev/null
-            fi
-            echo "Backup pushed: ${msg}"
-          fi
-          popd >/dev/null
-
-          if git clone --depth 1 "${clone_url}" "${verify_repo}" >/dev/null 2>&1; then
-            mapfile -t remote_parts < <(ls "${verify_repo}"/openclaw-state.tar.gz.part.* 2>/dev/null | sort)
-            if [[ "${#remote_parts[@]}" -ne "${#local_parts[@]}" ]]; then
-              echo "VERIFY WARNING: remote part count mismatch (${#remote_parts[@]}/${#local_parts[@]})."
-            else
-              verify_ok="true"
-              for src in "${local_parts[@]}"; do
-                name="$(basename "${src}")"
-                src_size="$(stat -f%z "${src}")"
-                remote_file="${verify_repo}/${name}"
-                if [[ ! -f "${remote_file}" ]]; then
-                  verify_ok="false"
-                  echo "VERIFY WARNING: remote missing ${name}"
-                  continue
-                fi
-                remote_size="$(stat -f%z "${remote_file}")"
-                if [[ "${src_size}" -ne "${remote_size}" ]]; then
-                  verify_ok="false"
-                  echo "VERIFY WARNING: size mismatch for ${name} (src=${src_size}, remote=${remote_size})"
-                fi
-              done
-              if [[ "${verify_ok}" == "true" ]]; then
-                echo "VERIFIED OK: remote parts and sizes match."
-              fi
-            fi
-          else
-            echo "VERIFY WARNING: unable to clone backup repo for post-push verification."
+            echo "VERIFY NOTE: remote size=${verify_size:-unknown}, local size=${file_size}."
           fi
           SCRIPT
 
@@ -424,44 +355,37 @@ jobs:
       - name: Restore OpenClaw State
         id: restore
         env:
-          BACKUP_PAT: ${{ secrets.OPENCLAW_BACKUP_PAT }}
-          BACKUP_REPO: ${{ secrets.OPENCLAW_BACKUP_REPO }}
+          WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+          WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+          WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
         run: |
           set -euo pipefail
 
           state_dir="${HOME}/.openclaw"
-          temp_repo="${RUNNER_TEMP}/openclaw-restore-${RANDOM}"
-          bundle="${RUNNER_TEMP}/openclaw-restore.tar.gz"
+          archive="${RUNNER_TEMP}/openclaw-restore.tar.gz"
           restored="false"
 
           mkdir -p "${state_dir}"
 
-          if [[ -z "${BACKUP_PAT:-}" || -z "${BACKUP_REPO:-}" ]]; then
-            echo "Backup secrets missing, skip restore."
-          elif git clone --depth 1 "https://${BACKUP_PAT}@github.com/${BACKUP_REPO}.git" "${temp_repo}" >/dev/null 2>&1; then
-            if ls "${temp_repo}"/openclaw-state.tar.gz.part.* >/dev/null 2>&1; then
-              mapfile -t parts < <(ls "${temp_repo}"/openclaw-state.tar.gz.part.* | sort)
-              cat "${parts[@]}" > "${bundle}"
-              tar -xzf "${bundle}" -C "${state_dir}"
-              restored="true"
-              echo "Restored from tar.gz split backup (${#parts[@]} part(s))."
-            elif [[ -f "${temp_repo}/openclaw-state.7z.001" ]]; then
-              if 7z t "${temp_repo}/openclaw-state.7z.001" >/dev/null 2>&1; then
-                7z x "${temp_repo}/openclaw-state.7z.001" -o"${state_dir}" -aoa >/dev/null
-                restored="true"
-                echo "Restored from legacy 7z backup."
-              else
-                echo "Legacy 7z backup integrity check failed, skipping restore."
-              fi
-            elif [[ -f "${temp_repo}/openclaw-state.zip" ]]; then
-              unzip -o "${temp_repo}/openclaw-state.zip" -d "${state_dir}" >/dev/null
-              restored="true"
-              echo "Restored from legacy zip backup."
-            else
-              echo "No previous backup found. This is a fresh state."
-            fi
+          if [[ -z "${WEBDAV_URL:-}" || -z "${WEBDAV_USER:-}" || -z "${WEBDAV_PASSWORD:-}" ]]; then
+            echo "WebDAV secrets missing, skip restore."
           else
-            echo "Backup repository clone failed, skip restore."
+            base_url="${WEBDAV_URL%/}"
+            remote_path="${base_url}/openclaw-backup/openclaw-state.tar.gz"
+
+            http_code="$(curl -w '%{http_code}' -o "${archive}" -s \
+              -u "${WEBDAV_USER}:${WEBDAV_PASSWORD}" \
+              "${remote_path}")"
+
+            if [[ "${http_code}" =~ ^2 && -f "${archive}" && -s "${archive}" ]]; then
+              tar -xzf "${archive}" -C "${state_dir}" && restored="true"
+              size="$(stat -f%z "${archive}" 2>/dev/null || stat -c%s "${archive}" 2>/dev/null || echo '?')"
+              echo "Restored from WebDAV backup (${size} bytes)."
+            elif [[ "${http_code}" == "404" ]]; then
+              echo "No previous backup found on WebDAV. This is a fresh state."
+            else
+              echo "WebDAV download failed (HTTP ${http_code}), skip restore."
+            fi
           fi
 
           has_config="false"
@@ -472,8 +396,7 @@ jobs:
           echo "restored=${restored}" >> "${GITHUB_OUTPUT}"
           echo "has_config=${has_config}" >> "${GITHUB_OUTPUT}"
 
-          rm -rf "${temp_repo}"
-          rm -f "${bundle}"
+          rm -f "${archive}"
 
       - name: Initialize OpenClaw
         id: initialize
@@ -636,15 +559,16 @@ jobs:
       - name: First Initialization Snapshot Backup
         if: steps.initialize.outputs.initialized_now == 'true'
         env:
-          BACKUP_PAT: ${{ secrets.OPENCLAW_BACKUP_PAT }}
-          BACKUP_REPO: ${{ secrets.OPENCLAW_BACKUP_REPO }}
+          WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+          WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+          WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
         run: |
           set -euo pipefail
 
           script_path="${GITHUB_WORKSPACE}/backup-openclaw-state.sh"
           if [[ -x "${script_path}" ]]; then
             echo "Running first initialization snapshot backup..."
-            "${script_path}" "${BACKUP_PAT:-}" "${BACKUP_REPO:-}"
+            "${script_path}" "${WEBDAV_URL:-}" "${WEBDAV_USER:-}" "${WEBDAV_PASSWORD:-}"
           else
             echo "Backup script missing, skip first snapshot backup."
           fi
@@ -652,8 +576,9 @@ jobs:
       - name: Monitor, Auto-Restart, and Periodic Backup
         env:
           TUNNEL_TOKEN: ${{ secrets.TUNNEL_TOKEN }}
-          BACKUP_PAT: ${{ secrets.OPENCLAW_BACKUP_PAT }}
-          BACKUP_REPO: ${{ secrets.OPENCLAW_BACKUP_REPO }}
+          WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+          WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+          WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
           MAX_RUNTIME_SECONDS: ${{ env.MAX_RUNTIME_SECONDS }}
           CF_PID_FILE: ${{ env.CF_PID_FILE }}
           CF_LOG_FILE: ${{ env.CF_LOG_FILE }}
@@ -806,7 +731,7 @@ jobs:
             if (( elapsed - last_backup >= backup_interval )); then
               echo "[${now}] Periodic backup at runtime ${run_min} minute(s)."
               if [[ -x "${backup_script}" ]]; then
-                "${backup_script}" "${BACKUP_PAT:-}" "${BACKUP_REPO:-}" || echo "Periodic backup failed."
+                "${backup_script}" "${WEBDAV_URL:-}" "${WEBDAV_USER:-}" "${WEBDAV_PASSWORD:-}" || echo "Periodic backup failed."
               else
                 echo "Backup script not found, skip periodic backup."
               fi
@@ -819,15 +744,16 @@ jobs:
       - name: Final State Backup
         if: always()
         env:
-          BACKUP_PAT: ${{ secrets.OPENCLAW_BACKUP_PAT }}
-          BACKUP_REPO: ${{ secrets.OPENCLAW_BACKUP_REPO }}
+          WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+          WEBDAV_USER: ${{ secrets.WEBDAV_USER }}
+          WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
         run: |
           set -euo pipefail
 
           script_path="${GITHUB_WORKSPACE}/backup-openclaw-state.sh"
           if [[ -x "${script_path}" ]]; then
             echo "Running final state backup..."
-            "${script_path}" "${BACKUP_PAT:-}" "${BACKUP_REPO:-}" || echo "Final backup failed."
+            "${script_path}" "${WEBDAV_URL:-}" "${WEBDAV_USER:-}" "${WEBDAV_PASSWORD:-}" || echo "Final backup failed."
           else
             echo "Backup script not found, skip final backup."
           fi
