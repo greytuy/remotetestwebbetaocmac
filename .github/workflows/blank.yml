@@ -19,6 +19,10 @@ on:
         description: "Monitor loop runtime minutes (60-345)"
         required: false
         default: "345"
+      ssh_user:
+        description: "SSH username (must match your Cloudflare email prefix)"
+        required: false
+        default: ""
 
 jobs:
   build:
@@ -49,6 +53,7 @@ jobs:
           INPUT_INIT_MODE: ${{ github.event.inputs.init_mode }}
           INPUT_MANUAL_WAIT_MINUTES: ${{ github.event.inputs.manual_wait_minutes }}
           INPUT_MAX_RUNTIME_MINUTES: ${{ github.event.inputs.max_runtime_minutes }}
+          INPUT_SSH_USER: ${{ github.event.inputs.ssh_user }}
         run: |
           set -euo pipefail
 
@@ -79,14 +84,20 @@ jobs:
             max_runtime_minutes=345
           fi
 
+          ssh_user="${INPUT_SSH_USER:-}"
+
           echo "INIT_MODE=${init_mode}" >> "${GITHUB_ENV}"
           echo "MANUAL_WAIT_MINUTES=${manual_wait_minutes}" >> "${GITHUB_ENV}"
           echo "MAX_RUNTIME_SECONDS=$((max_runtime_minutes * 60))" >> "${GITHUB_ENV}"
           echo "OPENCLAW_STATE_DIR=${HOME}/.openclaw" >> "${GITHUB_ENV}"
+          echo "CF_SSH_USER=${ssh_user}" >> "${GITHUB_ENV}"
 
           echo "Init mode: ${init_mode}"
           echo "Manual wait minutes: ${manual_wait_minutes}"
           echo "Monitor runtime minutes: ${max_runtime_minutes}"
+          if [[ -n "${ssh_user}" ]]; then
+            echo "SSH user (Cloudflare): ${ssh_user}"
+          fi
 
       - name: Setup Utilities
         run: |
@@ -142,23 +153,45 @@ jobs:
 
           sudo mdutil -i off -a || true
 
-          # ── Set password for all real users ──
+          pw="${EFFECTIVE_VNC_USER_PASSWORD}"
+          cf_user="${CF_SSH_USER:-}"
+
+          # ── Set password for existing runner users ──
           current_user="$(whoami)"
           echo "Current runner user: ${current_user}"
-          sudo dscl . -passwd "/Users/${current_user}" "${EFFECTIVE_VNC_USER_PASSWORD}" 2>/dev/null || true
+          sudo dscl . -passwd "/Users/${current_user}" "${pw}" 2>/dev/null || true
 
           console_user="$(stat -f%Su /dev/console 2>/dev/null || echo '')"
           if [[ -n "${console_user}" && "${console_user}" != "${current_user}" && "${console_user}" != "root" ]]; then
             echo "Console user: ${console_user}"
-            sudo dscl . -passwd "/Users/${console_user}" "${EFFECTIVE_VNC_USER_PASSWORD}" 2>/dev/null || true
+            sudo dscl . -passwd "/Users/${console_user}" "${pw}" 2>/dev/null || true
           fi
 
           for candidate in anka admin runner; do
             if [[ "${candidate}" != "${current_user}" && "${candidate}" != "${console_user:-}" ]] && dscl . -read "/Users/${candidate}" >/dev/null 2>&1; then
-              echo "Also setting password for user: ${candidate}"
-              sudo dscl . -passwd "/Users/${candidate}" "${EFFECTIVE_VNC_USER_PASSWORD}" 2>/dev/null || true
+              sudo dscl . -passwd "/Users/${candidate}" "${pw}" 2>/dev/null || true
             fi
           done
+
+          # ── Create Cloudflare SSH user (matches your CF email prefix) ──
+          if [[ -n "${cf_user}" ]]; then
+            echo "Creating Cloudflare SSH user: ${cf_user}"
+            if ! dscl . -read "/Users/${cf_user}" >/dev/null 2>&1; then
+              last_uid="$(dscl . -list /Users UniqueID | awk '{print $2}' | sort -n | tail -1)"
+              next_uid=$(( ${last_uid:-1000} + 1 ))
+              sudo dscl . -create "/Users/${cf_user}"
+              sudo dscl . -create "/Users/${cf_user}" UserShell /bin/bash
+              sudo dscl . -create "/Users/${cf_user}" RealName "${cf_user}"
+              sudo dscl . -create "/Users/${cf_user}" UniqueID "${next_uid}"
+              sudo dscl . -create "/Users/${cf_user}" PrimaryGroupID 80
+              sudo dscl . -create "/Users/${cf_user}" NFSHomeDirectory "/Users/${cf_user}"
+              sudo createhomedir -c -u "${cf_user}" >/dev/null 2>&1 || true
+            fi
+            sudo dscl . -passwd "/Users/${cf_user}" "${pw}"
+            echo "User ${cf_user} ready (password = your RDP_PASSWORD)."
+          else
+            echo "NOTE: ssh_user input is empty. If browser SSH fails, re-run workflow with ssh_user set to your Cloudflare email prefix."
+          fi
 
           echo "Available accounts (uid>=500):"
           dscl . -list /Users UniqueID | awk '$2 >= 500 {print "  - " $1 " (uid " $2 ")"}'
@@ -190,7 +223,6 @@ jobs:
 
           echo "=== SSH status ==="
           lsof -nP -iTCP:22 -sTCP:LISTEN 2>/dev/null || echo "WARNING: SSH not detected on :22"
-          echo "Login user: ${current_user}, password: your RDP_PASSWORD secret"
 
           # ── Enable VNC as fallback (optional) ──
           kickstart="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
@@ -201,7 +233,7 @@ jobs:
           sudo "${kickstart}" -activate 2>/dev/null || true
 
           echo "=== VNC status (fallback) ==="
-          lsof -nP -iTCP:5900 -sTCP:LISTEN 2>/dev/null || echo "(VNC on :5900 not detected, SSH is primary)"
+          lsof -nP -iTCP:5900 -sTCP:LISTEN 2>/dev/null || echo "(VNC not detected, SSH is primary)"
 
       - name: Start Cloudflared
         env:
