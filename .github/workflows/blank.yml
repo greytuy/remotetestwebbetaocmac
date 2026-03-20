@@ -142,6 +142,43 @@ jobs:
 
           sudo mdutil -i off -a || true
 
+          # ── Grant TCC permissions for screen sharing ──
+          tcc_sys="/Library/Application Support/com.apple.TCC/TCC.db"
+          tcc_user="${HOME}/Library/Application Support/com.apple.TCC/TCC.db"
+          ts="$(date +%s)"
+
+          tcc_insert() {
+            local db="$1" svc="$2" client="$3" ctype="$4"
+            local col_count
+            col_count="$(sudo sqlite3 "${db}" "PRAGMA table_info(access);" 2>/dev/null | wc -l | tr -d ' ')" || return 0
+            sudo sqlite3 "${db}" "DELETE FROM access WHERE service='${svc}' AND client='${client}';" 2>/dev/null || true
+            if (( col_count >= 17 )); then
+              sudo sqlite3 "${db}" \
+                "INSERT INTO access VALUES('${svc}','${client}',${ctype},2,4,1,NULL,NULL,0,'UNUSED',NULL,0,${ts},NULL,NULL,'UNUSED',${ts});" 2>/dev/null || true
+            else
+              sudo sqlite3 "${db}" \
+                "INSERT INTO access VALUES('${svc}','${client}',${ctype},2,4,1,NULL,NULL,0,'UNUSED',NULL,0,${ts});" 2>/dev/null || true
+            fi
+          }
+
+          for db_path in "${tcc_sys}" "${tcc_user}"; do
+            [[ -f "${db_path}" ]] || continue
+            echo "Patching TCC: ${db_path}"
+            tcc_insert "${db_path}" "kTCCServiceScreenCapture" "com.apple.screensharing.agent" 0
+            tcc_insert "${db_path}" "kTCCServiceScreenCapture" "/usr/libexec/screensharingd" 1
+            tcc_insert "${db_path}" "kTCCServiceScreenCapture" "/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent" 1
+            tcc_insert "${db_path}" "kTCCServiceScreenCapture" "/bin/bash" 1
+            tcc_insert "${db_path}" "kTCCServicePostEvent"     "com.apple.screensharing.agent" 0
+            tcc_insert "${db_path}" "kTCCServicePostEvent"     "/usr/libexec/screensharingd" 1
+            tcc_insert "${db_path}" "kTCCServicePostEvent"     "/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent" 1
+            tcc_insert "${db_path}" "kTCCServiceAccessibility" "com.apple.screensharing.agent" 0
+            tcc_insert "${db_path}" "kTCCServiceAccessibility" "/usr/libexec/screensharingd" 1
+          done
+
+          echo "TCC entries applied."
+          sudo sqlite3 "${tcc_sys}" "SELECT service,client,auth_value FROM access WHERE service LIKE 'kTCCService%' AND client LIKE '%screen%' OR client LIKE '%ARDAgent%';" 2>/dev/null || true
+
+          # ── Create vncuser ──
           if ! dscl . -read /Users/vncuser >/dev/null 2>&1; then
             last_uid="$(dscl . -list /Users UniqueID | awk '{print $2}' | sort -n | tail -1)"
             if [[ -z "${last_uid}" ]]; then
@@ -161,7 +198,9 @@ jobs:
 
           sudo dscl . -passwd /Users/vncuser "${EFFECTIVE_VNC_USER_PASSWORD}"
 
+          # ── Configure Remote Management / VNC ──
           kickstart="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
+
           sudo "${kickstart}" -configure -allowAccessFor -allUsers -privs -all
           sudo "${kickstart}" -configure -clientopts -setvnclegacy -vnclegacy yes
 
@@ -170,15 +209,32 @@ jobs:
           sudo "${kickstart}" -restart -agent -console
           sudo "${kickstart}" -activate
 
-          for i in {1..10}; do
+          # ── Fallback: also try launchctl to start Screen Sharing ──
+          if [[ -f /System/Library/LaunchDaemons/com.apple.screensharing.plist ]]; then
+            sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+          fi
+
+          # ── Wait for VNC listener ──
+          echo "Waiting for VNC to listen on :5900 ..."
+          for i in {1..20}; do
             if lsof -nP -iTCP:5900 -sTCP:LISTEN >/dev/null 2>&1; then
               echo "VNC is listening on localhost:5900"
-              exit 0
+              break
             fi
-            sleep 2
+            sleep 3
           done
 
-          echo "VNC listener was not detected on localhost:5900 (continue anyway, cloudflared may still connect)."
+          # ── Diagnostics ──
+          echo "=== VNC listener check ==="
+          lsof -nP -iTCP:5900 2>/dev/null || echo "(nothing on :5900)"
+          echo "=== screensharingd process ==="
+          ps aux | grep -i screenshar | grep -v grep || echo "(screensharingd not found)"
+          echo "=== ARDAgent process ==="
+          ps aux | grep -i ARDAgent | grep -v grep || echo "(ARDAgent not found)"
+
+          if ! lsof -nP -iTCP:5900 -sTCP:LISTEN >/dev/null 2>&1; then
+            echo "WARNING: VNC listener still not detected on :5900 (continue anyway)."
+          fi
 
       - name: Start Cloudflared
         env:
