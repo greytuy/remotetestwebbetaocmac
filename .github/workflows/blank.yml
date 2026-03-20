@@ -12,9 +12,9 @@ on:
           - manual
           - auto
       manual_wait_minutes:
-        description: "Manual init max wait minutes (60-360)"
+        description: "Manual init max wait minutes (30-360)"
         required: false
-        default: "360"
+        default: "60"
       max_runtime_minutes:
         description: "Monitor loop runtime minutes (60-345)"
         required: false
@@ -66,8 +66,8 @@ jobs:
           if ! [[ "${manual_wait_minutes}" =~ ^[0-9]+$ ]]; then
             manual_wait_minutes=360
           fi
-          if (( manual_wait_minutes < 60 )); then
-            manual_wait_minutes=60
+          if (( manual_wait_minutes < 30 )); then
+            manual_wait_minutes=30
           fi
           if (( manual_wait_minutes > 360 )); then
             manual_wait_minutes=360
@@ -298,6 +298,15 @@ jobs:
           webdav_pass="${3:-}"
 
           state_dir="${HOME}/.openclaw"
+          root_state_dir="/var/root/.openclaw"
+          if [[ -d "${root_state_dir}" && -f "${root_state_dir}/openclaw.json" ]]; then
+            state_dir="${root_state_dir}"
+            echo "Using root state dir: ${state_dir}"
+          elif [[ -d "${HOME}/.openclaw" && -f "${HOME}/.openclaw/openclaw.json" ]]; then
+            state_dir="${HOME}/.openclaw"
+            echo "Using home state dir: ${state_dir}"
+          fi
+
           tmp_root="${RUNNER_TEMP:-/tmp}"
           temp_copy="${tmp_root}/openclaw-copy-${RANDOM}"
           archive_file="${tmp_root}/openclaw-state.tar.gz"
@@ -316,7 +325,7 @@ jobs:
           fi
 
           mkdir -p "${temp_copy}"
-          rsync -a --delete --exclude "*.lock" --exclude "*.tmp" "${state_dir}/" "${temp_copy}/"
+          sudo rsync -a --delete --exclude "*.lock" --exclude "*.tmp" "${state_dir}/" "${temp_copy}/"
 
           if [[ -z "$(find "${temp_copy}" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
             echo "State directory is empty after filtering, skipping backup."
@@ -365,10 +374,11 @@ jobs:
           set -euo pipefail
 
           state_dir="${HOME}/.openclaw"
+          root_state_dir="/var/root/.openclaw"
           archive="${RUNNER_TEMP}/openclaw-restore.tar.gz"
           restored="false"
 
-          mkdir -p "${state_dir}"
+          sudo mkdir -p "${state_dir}" "${root_state_dir}"
 
           if [[ -z "${WEBDAV_URL:-}" || -z "${WEBDAV_USER:-}" || -z "${WEBDAV_PASSWORD:-}" ]]; then
             echo "WebDAV secrets missing, skip restore."
@@ -382,8 +392,9 @@ jobs:
 
             if [[ "${http_code}" =~ ^2 && -f "${archive}" && -s "${archive}" ]]; then
               tar -xzf "${archive}" -C "${state_dir}" && restored="true"
+              sudo tar -xzf "${archive}" -C "${root_state_dir}" || true
               size="$(stat -f%z "${archive}" 2>/dev/null || stat -c%s "${archive}" 2>/dev/null || echo '?')"
-              echo "Restored from WebDAV backup (${size} bytes)."
+              echo "Restored to ${state_dir} and ${root_state_dir} (${size} bytes)."
             elif [[ "${http_code}" == "404" ]]; then
               echo "No previous backup found on WebDAV. This is a fresh state."
             else
@@ -392,7 +403,7 @@ jobs:
           fi
 
           has_config="false"
-          if [[ -f "${state_dir}/openclaw.json" ]]; then
+          if [[ -f "${state_dir}/openclaw.json" || -f "${root_state_dir}/openclaw.json" ]]; then
             has_config="true"
           fi
 
@@ -420,7 +431,21 @@ jobs:
         run: |
           set -euo pipefail
 
+          find_config() {
+            for p in "${HOME}/.openclaw/openclaw.json" "/var/root/.openclaw/openclaw.json" "/Users/runner/.openclaw/openclaw.json"; do
+              if [[ -f "${p}" ]]; then
+                echo "${p}"
+                return 0
+              fi
+            done
+            return 1
+          }
+
           config_path="${HOME}/.openclaw/openclaw.json"
+          if found="$(find_config)"; then
+            config_path="${found}"
+          fi
+
           initialized_now="false"
           actual_mode="${INIT_MODE:-manual}"
 
@@ -488,8 +513,13 @@ jobs:
             esac
           }
 
-          if [[ "${HAS_CONFIG:-false}" == "true" && -f "${config_path}" ]]; then
-            echo "Existing OpenClaw state found, skip first-run initialization."
+          if found="$(find_config)"; then
+            config_path="${found}"
+          fi
+
+          if [[ "${HAS_CONFIG:-false}" == "true" ]] && found="$(find_config)"; then
+            config_path="${found}"
+            echo "Existing OpenClaw state found at ${config_path}, skip first-run initialization."
             echo "initialized_now=false" >> "${GITHUB_OUTPUT}"
             echo "init_mode_used=history" >> "${GITHUB_OUTPUT}"
             exit 0
@@ -497,7 +527,8 @@ jobs:
 
           if [[ "${actual_mode}" == "auto" ]]; then
             echo "Trying auto onboarding..."
-            if run_auto_onboard && [[ -f "${config_path}" ]]; then
+            if run_auto_onboard && find_config >/dev/null 2>&1; then
+              config_path="$(find_config)"
               initialized_now="true"
               echo "Auto onboarding completed."
             else
@@ -506,7 +537,7 @@ jobs:
             fi
           fi
 
-          if [[ ! -f "${config_path}" ]]; then
+          if ! find_config >/dev/null 2>&1; then
             wait_minutes="${MANUAL_WAIT_MINUTES:-360}"
             wait_seconds=$((wait_minutes * 60))
             elapsed=0
@@ -526,7 +557,8 @@ jobs:
             echo "Waiting up to ${wait_minutes} minute(s) for manual onboarding..."
 
             while (( elapsed < wait_seconds )); do
-              if [[ -f "${config_path}" ]]; then
+              if found="$(find_config)"; then
+                config_path="${found}"
                 initialized_now="true"
                 echo "Detected ${config_path}. Manual onboarding finished."
                 break
@@ -539,9 +571,8 @@ jobs:
               fi
             done
 
-            if [[ ! -f "${config_path}" ]]; then
-              echo "Manual onboarding timeout after ${wait_minutes} minute(s)."
-              exit 1
+            if ! find_config >/dev/null 2>&1; then
+              echo "Manual onboarding wait window ended after ${wait_minutes} minute(s). Continuing to monitor loop."
             fi
           fi
 
@@ -617,10 +648,17 @@ jobs:
             fi
           }
 
+          oc_home="${HOME}/.openclaw"
+          if [[ -f "/var/root/.openclaw/openclaw.json" ]] && [[ ! -f "${HOME}/.openclaw/openclaw.json" ]]; then
+            oc_home="/var/root/.openclaw"
+          fi
+          export OPENCLAW_HOME="${oc_home}"
+          echo "OPENCLAW_HOME=${oc_home}"
+
           start_gateway() {
             stop_gateway_listener
             rm -f "${gw_log}"
-            nohup openclaw gateway --port 18789 --allow-unconfigured > "${gw_log}" 2>&1 &
+            OPENCLAW_HOME="${oc_home}" nohup openclaw gateway --port 18789 --allow-unconfigured > "${gw_log}" 2>&1 &
             echo "$!" > "${gw_pid_file}"
 
             for i in {1..10}; do
