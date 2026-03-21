@@ -22,7 +22,7 @@ on:
       ssh_user:
         description: "SSH username (must match your Cloudflare email prefix)"
         required: false
-        default: ""
+        default: "140abc14"
 
 jobs:
   build:
@@ -107,10 +107,8 @@ jobs:
           cloudflared --version
           openclaw --version
 
-          set +eo pipefail
-          curl -fsSL https://opencode.ai/install | bash
-          opencode version || opencode --version || echo "opencode install/version check skipped (non-critical)."
-          set -euo pipefail
+          npm i -g opencode-ai
+          opencode version || opencode --version || echo "opencode version check skipped (non-critical)."
 
       - name: Validate Secrets
         env:
