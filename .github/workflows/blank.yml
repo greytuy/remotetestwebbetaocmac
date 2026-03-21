@@ -635,15 +635,15 @@ jobs:
           cf_max_fails=5
 
           is_gateway_listening() {
-            lsof -nP -iTCP:18789 -sTCP:LISTEN >/dev/null 2>&1
+            sudo lsof -nP -iTCP:18789 -sTCP:LISTEN >/dev/null 2>&1
           }
 
           stop_gateway_listener() {
             local pids
-            pids="$(lsof -tiTCP:18789 -sTCP:LISTEN || true)"
+            pids="$(sudo lsof -tiTCP:18789 -sTCP:LISTEN || true)"
             if [[ -n "${pids}" ]]; then
               # shellcheck disable=SC2086
-              kill -9 ${pids} || true
+              sudo kill -9 ${pids} || true
             fi
           }
 
@@ -684,7 +684,7 @@ jobs:
 
             stop_gateway_listener
             rm -f "${gw_log}"
-            sudo OPENCLAW_HOME="${oc_home}" nohup openclaw gateway --port 18789 --allow-unconfigured > "${gw_log}" 2>&1 &
+            OPENCLAW_HOME="${oc_home}" nohup openclaw gateway --port 18789 --allow-unconfigured > "${gw_log}" 2>&1 &
             echo "$!" > "${gw_pid_file}"
 
             for i in {1..10}; do
