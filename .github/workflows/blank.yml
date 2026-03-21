@@ -376,7 +376,8 @@ jobs:
           archive="${RUNNER_TEMP}/openclaw-restore.tar.gz"
           restored="false"
 
-          sudo mkdir -p "${state_dir}" "${root_state_dir}"
+          mkdir -p "${state_dir}"
+          sudo mkdir -p "${root_state_dir}"
 
           if [[ -z "${WEBDAV_URL:-}" || -z "${WEBDAV_USER:-}" || -z "${WEBDAV_PASSWORD:-}" ]]; then
             echo "WebDAV secrets missing, skip restore."
@@ -646,14 +647,41 @@ jobs:
             fi
           }
 
-          oc_home="${HOME}/.openclaw"
-          if [[ -f "/var/root/.openclaw/openclaw.json" ]] && [[ ! -f "${HOME}/.openclaw/openclaw.json" ]]; then
-            oc_home="/var/root/.openclaw"
+          find_oc_home() {
+            for p in "${HOME}/.openclaw" "/var/root/.openclaw"; do
+              if [[ -f "${p}/openclaw.json" ]]; then
+                echo "${p}"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          oc_home=""
+          if found_home="$(find_oc_home)"; then
+            oc_home="${found_home}"
           fi
-          export OPENCLAW_HOME="${oc_home}"
-          echo "OPENCLAW_HOME=${oc_home}"
+
+          if [[ -n "${oc_home}" ]]; then
+            export OPENCLAW_HOME="${oc_home}"
+            echo "OPENCLAW_HOME=${oc_home}"
+          else
+            echo "No openclaw.json found in any known path. Gateway will not auto-start."
+            echo "Connect via SSH and run 'openclaw onboard' first."
+          fi
 
           start_gateway() {
+            if [[ -z "${oc_home}" ]]; then
+              if found_home="$(find_oc_home)"; then
+                oc_home="${found_home}"
+                export OPENCLAW_HOME="${oc_home}"
+                echo "Found config at ${oc_home}, will start gateway."
+              else
+                echo "No openclaw.json config found, skip gateway start."
+                return 1
+              fi
+            fi
+
             stop_gateway_listener
             rm -f "${gw_log}"
             OPENCLAW_HOME="${oc_home}" nohup openclaw gateway --port 18789 --allow-unconfigured > "${gw_log}" 2>&1 &
@@ -713,11 +741,13 @@ jobs:
             return 1
           }
 
-          if ! is_gateway_listening; then
+          if [[ -n "${oc_home}" ]] && ! is_gateway_listening; then
             echo "Gateway is not running, starting now..."
             if ! start_gateway; then
               gw_fail_count=$((gw_fail_count + 1))
             fi
+          elif [[ -z "${oc_home}" ]]; then
+            echo "No config found, gateway auto-start skipped. Waiting for manual onboarding via SSH..."
           fi
 
           if ! is_cloudflared_running; then
@@ -733,7 +763,16 @@ jobs:
             run_min=$((elapsed / 60))
             now="$(date '+%H:%M:%S')"
 
-            if ! is_gateway_listening; then
+            if [[ -z "${oc_home}" ]]; then
+              if found_home="$(find_oc_home)"; then
+                oc_home="${found_home}"
+                export OPENCLAW_HOME="${oc_home}"
+                echo "[${now}] Config detected at ${oc_home}! Starting gateway..."
+                gw_fail_count=0
+              fi
+            fi
+
+            if [[ -n "${oc_home}" ]] && ! is_gateway_listening; then
               if (( gw_fail_count < gw_max_fails )); then
                 echo "[${now}] Gateway down, restarting ($((gw_fail_count + 1))/${gw_max_fails})..."
                 if start_gateway; then
@@ -745,7 +784,7 @@ jobs:
               if (( gw_fail_count >= gw_max_fails )); then
                 echo "[${now}] Gateway restart limit reached. Please connect and fix manually."
               fi
-            elif (( gw_fail_count > 0 )); then
+            elif [[ -n "${oc_home}" ]] && (( gw_fail_count > 0 )); then
               echo "[${now}] Gateway recovered, reset fail counter."
               gw_fail_count=0
             fi
