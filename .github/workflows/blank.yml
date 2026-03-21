@@ -378,6 +378,7 @@ jobs:
 
           mkdir -p "${state_dir}"
           sudo mkdir -p "${root_state_dir}"
+          sudo chmod -R a+rwx "${root_state_dir}" || true
 
           if [[ -z "${WEBDAV_URL:-}" || -z "${WEBDAV_USER:-}" || -z "${WEBDAV_PASSWORD:-}" ]]; then
             echo "WebDAV secrets missing, skip restore."
@@ -392,6 +393,7 @@ jobs:
             if [[ "${http_code}" =~ ^2 && -f "${archive}" && -s "${archive}" ]]; then
               tar -xzf "${archive}" -C "${state_dir}" && restored="true"
               sudo tar -xzf "${archive}" -C "${root_state_dir}" || true
+              sudo chmod -R a+rwx "${root_state_dir}" || true
               size="$(stat -f%z "${archive}" 2>/dev/null || stat -c%s "${archive}" 2>/dev/null || echo '?')"
               echo "Restored to ${state_dir} and ${root_state_dir} (${size} bytes)."
             elif [[ "${http_code}" == "404" ]]; then
@@ -661,6 +663,8 @@ jobs:
           if found_home="$(find_oc_home)"; then
             oc_home="${found_home}"
           fi
+
+          sudo chmod -R a+rwx /var/root/.openclaw 2>/dev/null || true
 
           if [[ -n "${oc_home}" ]]; then
             export OPENCLAW_HOME="${oc_home}"
