@@ -393,7 +393,16 @@ jobs:
             if [[ "${http_code}" =~ ^2 && -f "${archive}" && -s "${archive}" ]]; then
               tar -xzf "${archive}" -C "${state_dir}" && restored="true"
               sudo tar -xzf "${archive}" -C "${root_state_dir}" || true
+
+              if [[ -f "${state_dir}/openclaw.json" ]]; then
+                sed -i '' "s|/var/root/.openclaw|${state_dir}|g" "${state_dir}/openclaw.json" || true
+                sed -i '' "s|/private/var/root/.openclaw|${state_dir}|g" "${state_dir}/openclaw.json" || true
+                echo "Fixed config paths: /var/root/.openclaw -> ${state_dir}"
+              fi
+
+              sudo chmod a+x /var/root /private/var/root 2>/dev/null || true
               sudo chmod -R a+rwx "${root_state_dir}" || true
+
               size="$(stat -f%z "${archive}" 2>/dev/null || stat -c%s "${archive}" 2>/dev/null || echo '?')"
               echo "Restored to ${state_dir} and ${root_state_dir} (${size} bytes)."
             elif [[ "${http_code}" == "404" ]]; then
@@ -664,7 +673,14 @@ jobs:
             oc_home="${found_home}"
           fi
 
+          sudo chmod a+x /var/root /private/var/root 2>/dev/null || true
           sudo chmod -R a+rwx /var/root/.openclaw 2>/dev/null || true
+
+          runner_oc="${HOME}/.openclaw"
+          if [[ -f "${runner_oc}/openclaw.json" ]]; then
+            sed -i '' "s|/var/root/.openclaw|${runner_oc}|g" "${runner_oc}/openclaw.json" 2>/dev/null || true
+            sed -i '' "s|/private/var/root/.openclaw|${runner_oc}|g" "${runner_oc}/openclaw.json" 2>/dev/null || true
+          fi
 
           if [[ -n "${oc_home}" ]]; then
             export OPENCLAW_HOME="${oc_home}"
