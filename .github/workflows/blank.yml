@@ -14,7 +14,7 @@ on:
       manual_wait_minutes:
         description: "Manual init max wait minutes (30-360)"
         required: false
-        default: "60"
+        default: "30"
       max_runtime_minutes:
         description: "Monitor loop runtime minutes (60-345)"
         required: false
