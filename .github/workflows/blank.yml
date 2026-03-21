@@ -432,7 +432,7 @@ jobs:
 
           find_config() {
             for p in "${HOME}/.openclaw/openclaw.json" "/var/root/.openclaw/openclaw.json" "/Users/runner/.openclaw/openclaw.json"; do
-              if [[ -f "${p}" ]]; then
+              if [[ -f "${p}" ]] || sudo test -f "${p}" 2>/dev/null; then
                 echo "${p}"
                 return 0
               fi
@@ -649,7 +649,7 @@ jobs:
 
           find_oc_home() {
             for p in "${HOME}/.openclaw" "/var/root/.openclaw"; do
-              if [[ -f "${p}/openclaw.json" ]]; then
+              if [[ -f "${p}/openclaw.json" ]] || sudo test -f "${p}/openclaw.json" 2>/dev/null; then
                 echo "${p}"
                 return 0
               fi
@@ -684,7 +684,7 @@ jobs:
 
             stop_gateway_listener
             rm -f "${gw_log}"
-            OPENCLAW_HOME="${oc_home}" nohup openclaw gateway --port 18789 --allow-unconfigured > "${gw_log}" 2>&1 &
+            sudo OPENCLAW_HOME="${oc_home}" nohup openclaw gateway --port 18789 --allow-unconfigured > "${gw_log}" 2>&1 &
             echo "$!" > "${gw_pid_file}"
 
             for i in {1..10}; do
